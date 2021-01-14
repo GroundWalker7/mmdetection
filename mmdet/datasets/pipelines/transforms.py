@@ -4,6 +4,11 @@ import mmcv
 import numpy as np
 from numpy import random
 
+import cv2
+import operator
+from functools import reduce
+import math
+
 from mmdet.core import PolygonMasks
 from mmdet.core.evaluation.bbox_overlaps import bbox_overlaps
 from ..builder import PIPELINES
@@ -20,6 +25,65 @@ except ImportError:
     albumentations = None
     Compose = None
 
+@PIPELINES.register_module()
+class NI_AUG(object):
+    '''Non-uniform illumination
+    '''
+    def __init__(self, p=0.8, thr=0.2):
+        self.p = p
+        self.thr = thr
+    
+    def img_aug(self, img: np.ndarray) -> (np.ndarray, np.ndarray):
+        def gamma_trans(img, gamma):
+            # 具体做法是先归一化到1，然后gamma作为指数值求出新的像素值再还原
+            gamma_table = [np.power(x/255.0, gamma)*255.0 for x in range(256)]
+            gamma_table = np.round(np.array(gamma_table)).astype(np.uint8)
+            
+            # 实现这个映射用的是OpenCV的查表函数
+            return cv2.LUT(img, gamma_table)
+        img = img.copy()
+        rows=img.shape[0]
+        cols=img.shape[1]
+        channels=img.shape[2]
+        while True:
+            mask = np.zeros(img.shape, dtype=np.uint8)
+            # 生成随机点
+            coords = []
+            for _ in range(4):
+                p = (random.random() * img.shape[1] * 1.2, random.random() * img.shape[0] * 1.2)
+                coords.append(p)
+            center = tuple(map(operator.truediv, reduce(lambda x, y: map(operator.add, x, y), coords), [len(coords)] * 2))
+            coords = sorted(coords, key=lambda coord: (-135 - math.degrees(math.atan2(*tuple(map(operator.sub, coord, center))[::-1]))) % 360)
+
+            roi_corners=np.array([coords],dtype=np.int32)
+            channel_count=channels
+            ignore_mask_color = (255,)*channel_count
+            #创建mask层
+            cv2.fillPoly(mask, roi_corners, ignore_mask_color)
+            if np.count_nonzero(mask) / img.shape[0] / img.shape[1] / img.shape[2] >= self.thr: # 0.2
+                break
+        #为每个像素进行与操作，除mask区域外，全为0
+        masked_image = cv2.bitwise_and(img, mask)
+        
+        cv2.fillPoly(img, roi_corners, 0)
+
+        gamma = random.random() * 3 + 2
+        masked_image = img + gamma_trans(masked_image, gamma)
+        mask = mask.mean(axis=2, keepdims=True).transpose(2, 0, 1) / 255  # shape [h, w, 1]
+        
+        return masked_image, mask
+
+    def __call__(self, results):
+        if np.random.rand() > self.p:
+            return results
+            
+        for key in results.get('img_fields', ['img']):
+            img = results[key]
+            masked_image, _ = self.img_aug(img)
+            results[key] = masked_image
+        
+        return results
+        
 
 @PIPELINES.register_module()
 class Resize(object):
